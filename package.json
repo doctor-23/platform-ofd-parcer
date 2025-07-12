@@ -4,7 +4,11 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "start": "pm2 start parser.js --name ofd-parser",
+    "delete": "pm2 delete parser.js",
+    "restart": "pm2 restart ofd-parser",
+    "log": "pm2 logs ofd-parser",
+    "stop": "pm2 stop ofd-parser"
   },
   "keywords": [],
   "author": "",
