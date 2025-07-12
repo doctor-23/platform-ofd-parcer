@@ -93,7 +93,14 @@ async function solveCaptcha(imagePath) {
         maxConcurrency: CONFIG.threads,
         puppeteerOptions: {
             headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox'],
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--disable-images'
+            ],
         },
         retryLimit: CONFIG.maxAttempts,
         retryDelay: 5000,
