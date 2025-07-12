@@ -398,6 +398,11 @@ class BrowserManager extends EventEmitter {
         );
     }
 
+    // Alias for backward compatibility
+    async performOperation(operation) {
+        return this.safePageOperation(operation);
+    }
+
     async isPageStable(page) {
         if (!page || page.isClosed()) return false;
 
