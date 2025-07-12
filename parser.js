@@ -101,44 +101,36 @@ async function solveCaptcha(imagePath) {
 
     await cluster.task(async ({ page, data: { uuid, url, proxy } }) => {
         try {
-            console.log(`[${uuid}] Обработка через прокси: ${proxy}`);
-
-            if (!proxy) throw new Error('Прокси не задан');
+            page.on('error', err => console.error(`[${uuid}] Page error:`, err));
+            page.on('pageerror', err => console.error(`[${uuid}] Page runtime error:`, err));
+            page.on('close', () => console.warn(`[${uuid}] Page was closed unexpectedly`));
 
             const [auth, host] = proxy.split('@');
             const [username, password] = auth.split(':');
-            const proxyHost = `http://${host}`;
-
-            // Настроить прокси для страницы
             await page.authenticate({ username, password });
 
-            // Перейти по URL
-            await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+            await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
-            // Проверяем капчу
             const captchaElement = await page.$('#captchaImg');
-            if (!captchaElement) throw new Error('Капча не найдена');
+            if (!captchaElement) throw new Error('Captcha not found');
 
             const captchaPath = path.join(CONFIG.captchaDir, `captcha_${uuid}.png`);
             await captchaElement.screenshot({ path: captchaPath });
 
             const captchaText = await solveCaptcha(captchaPath);
-            if (!captchaText) throw new Error('Не удалось решить капчу');
+            if (!captchaText) throw new Error('Failed to solve captcha');
 
             await page.type('#captcha', captchaText);
             await page.click('button[type="submit"]');
 
-            // Ждем загрузки чека
             await page.waitForSelector('.cheque.check.wave-top.wave-white', { timeout: 15000 });
 
             const html = await page.content();
             fs.writeFileSync(path.join(CONFIG.outputDir, `result_${uuid}.html`), html);
 
-            console.log(`[${uuid}] ✅ Успешно`);
+            console.log(`[${uuid}] ✅ Success`);
 
         } catch (err) {
-            const errorPath = path.join(CONFIG.errorDir, `error_${uuid}.txt`);
-            fs.writeFileSync(errorPath, `Ошибка: ${err.message}`);
             console.error(`[${uuid}] ❌ ${err.message}`);
             throw err;
         }
@@ -156,3 +148,4 @@ async function solveCaptcha(imagePath) {
 
     console.log(`==> Обработка завершена: ${formatDate(new Date())}`);
 })();
+
