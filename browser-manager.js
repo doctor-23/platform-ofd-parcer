@@ -3,6 +3,8 @@ const os = require('os');
 const { EventEmitter } = require('events');
 const path = require('path');
 const fs = require('fs-extra');
+const { exec } = require('child_process');
+const UserAgent = require('user-agents');
 
 class BrowserManager extends EventEmitter {
     constructor(options = {}) {
@@ -13,8 +15,8 @@ class BrowserManager extends EventEmitter {
         this.retryCount = 0;
         this.isInitializing = false;
         this.lastRestartTime = 0;
-        
-        // Настройки по умолчанию
+
+        // Default settings
         this.options = {
             maxOperationsBeforeRestart: 30,
             maxRetries: 3,
@@ -23,8 +25,8 @@ class BrowserManager extends EventEmitter {
             userDataDir: path.join(process.cwd(), 'browser-data'),
             ...options
         };
-        
-        // Создаем директорию для данных браузера
+
+        // Create browser data directory
         fs.ensureDirSync(this.options.userDataDir);
     }
 
@@ -33,13 +35,13 @@ class BrowserManager extends EventEmitter {
             await new Promise(resolve => setTimeout(resolve, 100));
         }
 
-        const needsRestart = 
-            !this.browser || 
-            !this.page || 
-            this.page.isClosed() || 
+        const needsRestart =
+            !this.browser ||
+            !this.page ||
+            this.page.isClosed() ||
             this.operationCount >= this.options.maxOperationsBeforeRestart ||
             await this.isMemoryUsageHigh() ||
-            Date.now() - this.lastRestartTime > 3600000; // Перезапуск каждый час
+            Date.now() - this.lastRestartTime > 3600000; // Restart every hour
 
         if (needsRestart) {
             await this.restartBrowser();
@@ -50,16 +52,21 @@ class BrowserManager extends EventEmitter {
     }
 
     async isMemoryUsageHigh() {
-        if (process.platform !== 'win32') return false;
-        
+        if (process.platform === 'win32') return false; // Skip memory check on Windows
+
         try {
-            const totalMem = os.totalmem() / (1024 * 1024); // в МБ
-            const freeMem = os.freemem() / (1024 * 1024); // в МБ
+            const totalMem = os.totalmem() / (1024 * 1024); // in MB
+            const freeMem = os.freemem() / (1024 * 1024); // in MB
             const usedMem = totalMem - freeMem;
-            
-            return usedMem > (totalMem * 0.8); // 80% использования
+            const usagePercent = (usedMem / totalMem) * 100;
+
+            if (usagePercent > 80) {
+                console.warn(`High memory usage detected: ${usagePercent.toFixed(2)}%`);
+                return true;
+            }
+            return false;
         } catch (error) {
-            console.warn('Не удалось проверить использование памяти:', error);
+            console.warn('Failed to check memory usage:', error);
             return false;
         }
     }
@@ -70,8 +77,21 @@ class BrowserManager extends EventEmitter {
 
         try {
             await this.closeBrowser();
-            console.log('Инициализация нового экземпляра браузера...');
-            
+            console.log('Initializing new browser instance...');
+
+            // Remove old SingletonLock if it exists
+            if (process.platform !== 'win32') {
+                try {
+                    const lockFile = path.join(this.options.userDataDir, 'SingletonLock');
+                    if (fs.existsSync(lockFile)) {
+                        fs.unlinkSync(lockFile);
+                        console.log('Removed old browser lock file');
+                    }
+                } catch (e) {
+                    console.warn('Failed to remove lock file:', e.message);
+                }
+            }
+
             const launchOptions = {
                 headless: this.options.headless,
                 args: [
@@ -80,89 +100,88 @@ class BrowserManager extends EventEmitter {
                     '--disable-dev-shm-usage',
                     '--disable-accelerated-2d-canvas',
                     '--disable-gpu',
-                    '--window-size=1920,1080',
-                    `--user-data-dir=${this.options.userDataDir}`,
+                    '--disable-software-rasterizer',
+                    '--disable-webgl',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-site-isolation-trials',
                     '--disable-blink-features=AutomationControlled',
                     '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--disable-site-isolation-trials'
+                    '--ignore-certificate-errors',
+                    '--ignore-https-errors=yes',
+                    '--disable-extensions',
+                    '--disable-background-networking',
+                    '--disable-sync',
+                    '--metrics-recording-only',
+                    '--mute-audio',
+                    '--no-first-run',
+                    '--safebrowsing-disable-auto-update',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-default-apps',
+                    '--disable-hang-monitor',
+                    '--disable-prompt-on-repost',
+                    '--disable-background-timer-throttling',
+                    '--disable-renderer-backgrounding',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-ipc-flooding-protection',
+                    '--window-size=1920,1080',
+                    `--user-data-dir=${this.options.userDataDir}`,
+                    '--remote-debugging-port=0' // Random port
                 ],
                 timeout: 60000,
                 defaultViewport: null,
                 ignoreHTTPSErrors: true,
+                dumpio: true, // Browser logs to console
                 ...this.options.launchOptions
             };
 
-            // Добавляем прокси, если указаны
+            // Add proxy if configured
             if (this.options.proxy) {
                 const proxy = this.options.proxy;
-                const proxyUrl = proxy.username 
-                    ? `${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`
-                    : `${proxy.host}:${proxy.port}`;
-                
+                const proxyUrl = proxy.username && proxy.password
+                    ? `http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`
+                    : `http://${proxy.host}:${proxy.port}`;
+
+                console.log(`Using proxy: ${proxy.host}:${proxy.port}`);
                 launchOptions.args.push(`--proxy-server=${proxyUrl}`);
+                launchOptions.args.push('--proxy-bypass-list=<-loopback>');
             }
 
+            // Launch the browser
             this.browser = await puppeteer.launch(launchOptions);
 
-            // Обработчик отключения браузера
-            this.browser.on('disconnected', () => {
-                console.warn('Браузер отключился, планируем перезапуск...');
-                this.restartBrowser().catch(console.error);
-            });
+            // Create a new page
+            const pages = await this.browser.pages();
+            this.page = pages[0] || await this.browser.newPage();
 
-            this.page = await this.browser.newPage();
-            
-            // Установка User-Agent
-            if (this.options.userAgent) {
-                await this.page.setUserAgent(this.options.userAgent);
-            }
-
-            // Настройка таймаутов
+            // Set default navigation timeout
             this.page.setDefaultNavigationTimeout(this.options.defaultTimeout);
-            this.page.setDefaultTimeout(this.options.defaultTimeout);
 
-            // Эмуляция человека
-            await this.page.setExtraHTTPHeaders({
-                'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+            // Browser disconnect handler
+            this.browser.on('disconnected', async () => {
+                console.warn('Browser disconnected, attempting to restart...');
+                this.browser = null;
+                this.page = null;
+                try {
+                    await this.restartBrowser();
+                } catch (e) {
+                    console.error('Failed to restart browser after disconnect:', e);
+                }
             });
 
-            await this.page.evaluateOnNewDocument(() => {
-                // Удаляем webdriver property
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => false,
-                });
-                
-                // Удаляем свойства, которые могут выдать автоматизацию
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                
-                // Эмуляция WebGL
-                const getParameter = WebGLRenderingContext.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                    if (parameter === 37445) {
-                        return 'Intel Inc.';
-                    }
-                    if (parameter === 37446) {
-                        return 'Intel Iris OpenGL Engine';
-                    }
-                    return getParameter(parameter);
-                };
-            });
+            // Configure page settings
+            await this.page.setUserAgent(new UserAgent().toString());
+            await this.page.setJavaScriptEnabled(true);
+            await this.page.setDefaultNavigationTimeout(this.options.defaultTimeout);
+            await this.page.setDefaultTimeout(this.options.defaultTimeout);
 
-            // Очистка данных
+            // Clear browser data
             await this.clearBrowserData();
 
-            this.operationCount = 0;
-            this.retryCount = 0;
-            this.lastRestartTime = Date.now();
-
-            console.log('Браузер успешно инициализирован');
-            this.emit('browserRestarted');
+            console.log('Browser initialized successfully');
+            return this.page;
 
         } catch (error) {
-            console.error('Ошибка при инициализации браузера:', error);
+            console.error('Browser initialization failed:', error);
             this.emit('error', error);
             throw error;
         } finally {
@@ -170,57 +189,146 @@ class BrowserManager extends EventEmitter {
         }
     }
 
-    async clearBrowserData() {
-        if (!this.page) return;
-        
-        try {
-            // Очистка кук
-            const client = await this.page.target().createCDPSession();
-            await client.send('Network.clearBrowserCookies');
-            await client.send('Network.clearBrowserCache');
-            
-            // Очистка хранилищ
-            await this.page.evaluate(() => {
-                localStorage.clear();
-                sessionStorage.clear();
-                indexedDB.databases().then(dbs => {
-                    dbs.forEach(db => {
-                        if (db.name) indexedDB.deleteDatabase(db.name);
-                    });
-                }).catch(() => {});
-            });
-            
-        } catch (error) {
-            console.warn('Не удалось очистить данные браузера:', error);
-        }
-    }
-
-    async restartBrowser() {
-        console.log('Планируется перезапуск браузера...');
-        try {
-            await this.initializeBrowser();
-        } catch (error) {
-            console.error('Ошибка при перезапуске браузера:', error);
-            // Пробуем снова через 5 секунд
-            await new Promise(resolve => setTimeout(resolve, 5000));
-            return this.restartBrowser();
-        }
-    }
-
     async closeBrowser() {
+        if (!this.browser) return;
+
+        const browserProcess = this.browser.process();
+        const browserPid = browserProcess ? browserProcess.pid : null;
+
         try {
-            if (this.page && !this.page.isClosed()) {
-                await this.page.close().catch(() => {});
+            // Close all pages
+            try {
+                const pages = await this.browser.pages();
+                await Promise.all(pages.map(page => page.close().catch(e =>
+                    console.warn('Error closing page:', e.message)
+                )));
+            } catch (e) {
+                console.warn('Error closing pages:', e.message);
             }
-            if (this.browser) {
-                await this.browser.close().catch(() => {});
+
+            // Close the browser
+            try {
+                await this.browser.close();
+            } catch (e) {
+                console.warn('Error closing browser:', e.message);
+                // Force kill the process if it's still alive
+                if (browserPid && process.platform !== 'win32') {
+                    try {
+                        process.kill(browserPid, 'SIGKILL');
+                    } catch (killError) {
+                        console.warn('Failed to kill browser process:', killError.message);
+                    }
+                }
             }
+
+            // Additional cleanup for Unix-based systems
+            if (process.platform === 'linux' || process.platform === 'darwin') {
+                try {
+                    // Kill any remaining Chrome/Chromium processes
+                    exec('pkill -f chrome || true');
+                    exec('pkill -f chromium || true');
+                } catch (e) {
+                    console.warn('Error cleaning up browser processes:', e.message);
+                }
+            }
+
         } catch (error) {
-            console.error('Ошибка при закрытии браузера:', error);
+            console.error('Error during browser cleanup:', error);
             this.emit('error', error);
         } finally {
             this.browser = null;
             this.page = null;
+            this.isInitializing = false;
+
+            // Small delay before next operation
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+    }
+
+    async clearBrowserData() {
+        if (!this.page) return;
+
+        try {
+            // Clear storage
+            await this.page.evaluate(() => {
+                try {
+                    localStorage.clear();
+                    sessionStorage.clear();
+                    if (indexedDB && indexedDB.databases) {
+                        indexedDB.databases().then(dbs => {
+                            dbs.forEach(db => {
+                                if (db && db.name) {
+                                    indexedDB.deleteDatabase(db.name);
+                                }
+                            });
+                        }).catch(() => {});
+                    }
+                } catch (e) {
+                    console.warn('Failed to clear storage:', e);
+                }
+            });
+
+            // Clear cookies and cache
+            try {
+                const client = await this.page.target().createCDPSession();
+                await client.send('Network.clearBrowserCookies');
+                await client.send('Network.clearBrowserCache');
+            } catch (e) {
+                console.warn('Failed to clear cookies/cache:', e.message);
+            }
+
+            // Clear service workers
+            try {
+                const client = await this.page.target().createCDPSession();
+                await client.send('ServiceWorker.enable');
+                const {registrations} = await client.send('ServiceWorker.getRegistrations');
+                await Promise.all(registrations.map(registration =>
+                    client.send('ServiceWorker.unregister', {
+                        scopeUrl: registration.scopeURL
+                    }).catch(() => {})
+                ));
+            } catch (e) {
+                console.warn('Failed to clear service workers:', e.message);
+            }
+
+        } catch (error) {
+            console.warn('Failed to clear browser data:', error);
+        }
+    }
+
+    async restartBrowser() {
+        console.log('Restarting browser...');
+        this.operationCount = 0;
+        this.lastRestartTime = Date.now();
+
+        const maxRetries = 3;
+        let lastError;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await this.closeBrowser();
+
+                // Add delay between retries
+                if (attempt > 1) {
+                    const delay = 1000 * Math.pow(2, attempt); // Exponential backoff
+                    console.log(`Retry ${attempt}/${maxRetries} in ${delay}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+
+                await this.initializeBrowser();
+                console.log('Browser restarted successfully');
+                return; // Success
+
+            } catch (error) {
+                lastError = error;
+                console.error(`Browser restart failed (attempt ${attempt}/${maxRetries}):`, error.message);
+
+                // If last attempt, rethrow the error
+                if (attempt === maxRetries) {
+                    console.error('Failed to restart browser after multiple attempts');
+                    throw new Error(`Failed to restart browser after ${maxRetries} attempts: ${lastError.message}`);
+                }
+            }
         }
     }
 
@@ -231,99 +339,117 @@ class BrowserManager extends EventEmitter {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 const page = await this.getPage();
-                
-                // Проверяем стабильность страницы перед операцией
+
+                // Check page stability before operation
                 if (!await this.isPageStable(page)) {
                     throw new Error('Page is not stable');
                 }
 
                 const result = await operation(page);
-                
-                // Проверяем стабильность после операции
+
+                // Check page stability after operation
                 if (!await this.isPageStable(page)) {
                     throw new Error('Page became unstable after operation');
                 }
 
-                this.retryCount = 0; // Сброс счетчика при успешной операции
+                this.retryCount = 0; // Reset retry counter on success
                 return result;
-                
+
             } catch (error) {
                 lastError = error;
-                console.warn(`Попытка ${attempt}/${maxRetries} не удалась:`, error.message);
-                
+                console.warn(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
+
                 if (attempt < maxRetries) {
-                    // Экспоненциальная задержка
+                    // Exponential backoff
                     const delay = 1000 * Math.pow(2, attempt);
-                    console.log(`Повтор через ${delay}мс...`);
+                    console.log(`Retrying in ${delay}ms...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
-                    
-                    // Принудительный перезапуск браузера при определенных ошибках
+
+                    // Force restart on critical errors
                     if (this.shouldRestartBrowser(error)) {
-                        console.log('Обнаружена критическая ошибка, перезапускаем браузер...');
+                        console.log('Critical error detected, restarting browser...');
                         await this.restartBrowser();
                     }
                 }
             }
         }
 
-        // Если все попытки исчерпаны
-        const error = new Error(`Не удалось выполнить операцию после ${maxRetries} попыток: ${lastError?.message}`);
+        // All attempts exhausted
+        const error = new Error(
+            `Failed to complete operation after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`
+        );
         this.emit('operationFailed', error);
         throw error;
     }
 
-    async isPageStable(page) {
-        try {
-            // Проверяем, что страница жива и отзывчива
-            await Promise.race([
-                page.evaluate(() => true),
-                new Promise((_, reject) => 
-                    setTimeout(() => reject(new Error('Page not responding')), 5000)
-                )
-            ]);
-            return true;
-        } catch (error) {
-            console.warn('Проверка стабильности страницы не пройдена:', error);
-            return false;
-        }
-    }
-
     shouldRestartBrowser(error) {
         if (!error || !error.message) return false;
-        
+
         const errorMessage = error.message.toLowerCase();
         const criticalErrors = [
-            'navigating frame was detached',
-            'protocol error',
-            'target closed',
-            'execution context was destroyed',
-            'navigation failed',
-            'session closed',
-            'page crashed',
-            'no page',
-            'timeout',
-            'connection lost'
+            'navigation', 'timeout', 'detached', 'closed', 'crashed',
+            'session', 'target', 'protocol', 'socket', 'connection',
+            'no such', 'failed to launch', 'no support', 'proxy',
+            'net::', 'ERR_', 'NS_', 'TARGET_', 'ECONNREFUSED', 'ENOTFOUND'
         ];
 
-        return criticalErrors.some(criticalError => 
+        return criticalErrors.some(criticalError =>
             errorMessage.includes(criticalError.toLowerCase())
         );
     }
 
-    async performOperation(operation) {
-        return this.safePageOperation(operation);
-    }
+    async isPageStable(page) {
+        if (!page || page.isClosed()) return false;
 
-    getStats() {
-        return {
-            operationCount: this.operationCount,
-            lastRestartTime: new Date(this.lastRestartTime),
-            uptime: this.lastRestartTime ? Date.now() - this.lastRestartTime : 0,
-            memoryUsage: process.memoryUsage(),
-            systemFreeMemory: os.freemem(),
-            systemTotalMemory: os.totalmem()
-        };
+        try {
+            // Check if page is responsive
+            await page.evaluate(() => true);
+
+            // Check document ready state
+            const isDocumentReady = await page.evaluate(
+                () => document.readyState === 'complete' || document.readyState === 'interactive'
+            );
+
+            if (!isDocumentReady) return false;
+
+            // Check for modal dialogs
+            const hasModal = await page.evaluate(
+                () => document.querySelector('dialog[open], .modal[open], .dialog[open]') !== null
+            );
+
+            if (hasModal) return false;
+
+            // Check for network idle
+            const networkIdle = await page.evaluate(() => {
+                try {
+                    const resources = window.performance.getEntriesByType('resource') || [];
+                    return resources
+                        .filter(r => r.initiatorType === 'xmlhttprequest' || r.initiatorType === 'fetch')
+                        .every(r => r.duration < 1000); // All requests finished within 1s
+                } catch (e) {
+                    console.warn('Network idle check failed:', e);
+                    return true; // Assume network is idle if check fails
+                }
+            });
+
+            return networkIdle;
+
+        } catch (error) {
+            console.warn('Page stability check failed:', error);
+            return false;
+        }
     }
 }
+
+// Add error handling for uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught exception:', error);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled rejection at:', promise, 'reason:', reason);
+    process.exit(1);
+});
 
 module.exports = BrowserManager;
