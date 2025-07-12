@@ -8,7 +8,7 @@ const {Cluster} = require('puppeteer-cluster');
 const CONFIG = {
     threads: 25, // Количество потоков
     maxAttempts: 3, // Попыток на чек
-    delayBetweenRequests: 2000, // Задержка между запросами (мс)
+    delayBetweenRequests: 5000, // Задержка между запросами (мс)
     outputDir: 'results',
     captchaDir: 'captcha',
     errorDir: 'errors',
@@ -26,6 +26,20 @@ const CONFIG = {
         'xUEaT2:yp5SJhxMkS@45.90.196.78:3000',
         'xUEaT2:yp5SJhxMkS@46.8.222.100:3000',
     ],
+    // Список прокси (10 штук)
+    // proxies: [
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    //     'user:pass@ip:port',
+    // ],
+
     // Чеки (UUID: URL)
     receiptsFile: 'receipts.json',
 };
