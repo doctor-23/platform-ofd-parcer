@@ -35,151 +35,109 @@ class BrowserManager extends EventEmitter {
             await new Promise(resolve => setTimeout(resolve, 100));
         }
 
-        const needsRestart =
-            !this.browser ||
-            !this.page ||
-            this.page.isClosed() ||
-            this.operationCount >= this.options.maxOperationsBeforeRestart ||
-            await this.isMemoryUsageHigh() ||
-            Date.now() - this.lastRestartTime > 3600000; // Restart every hour
+        if (!this.page || this.page.isClosed()) {
+            // Проверяем, нужно ли перезапустить браузер
+            const needsRestart = await this.shouldRestartBrowser();
+            if (needsRestart) {
+                try {
+                    await this.restartBrowser();
+                } catch (error) {
+                    console.error('Failed to restart browser:', error);
+                    throw error;
+                }
+            }
 
-        if (needsRestart) {
-            await this.restartBrowser();
+            // Создаем новую страницу
+            try {
+                this.page = await this.browser.newPage();
+                await this.page.setViewport({ width: 1920, height: 1080 });
+                await this.page.setUserAgent(new UserAgent().toString());
+                await this.page.setDefaultNavigationTimeout(this.options.defaultTimeout);
+                await this.page.setDefaultTimeout(this.options.defaultTimeout);
+            } catch (error) {
+                console.error('Failed to create new page:', error);
+                throw error;
+            }
+        }
+
+        // Проверяем стабильность страницы
+        if (!await this.isPageStable(this.page)) {
+            throw new Error('Page is not stable');
         }
 
         this.operationCount++;
+
         return this.page;
     }
 
     async isMemoryUsageHigh() {
-        if (process.platform === 'win32') return false; // Skip memory check on Windows
+        if (!this.browser) return false;
 
         try {
-            const totalMem = os.totalmem() / (1024 * 1024); // in MB
-            const freeMem = os.freemem() / (1024 * 1024); // in MB
-            const usedMem = totalMem - freeMem;
-            const usagePercent = (usedMem / totalMem) * 100;
+            const memoryInfo = await this.browser.memory();
+            const heapUsed = memoryInfo.jsHeapUsedSize;
+            const heapTotal = memoryInfo.jsHeapTotalSize;
+            const heapUsagePercentage = (heapUsed / heapTotal) * 100;
 
-            if (usagePercent > 80) {
-                console.warn(`High memory usage detected: ${usagePercent.toFixed(2)}%`);
-                return true;
-            }
-            return false;
+            console.log(`Memory usage: ${heapUsagePercentage.toFixed(1)}% (used: ${heapUsed} / total: ${heapTotal})`);
+
+            return heapUsagePercentage > 80;
         } catch (error) {
-            console.warn('Failed to check memory usage:', error);
+            console.error('Error checking memory usage:', error);
             return false;
         }
     }
 
     async initializeBrowser() {
-        if (this.isInitializing) return;
+        if (this.isInitializing) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            return this.initializeBrowser();
+        }
+
         this.isInitializing = true;
-
         try {
-            await this.closeBrowser();
-            console.log('Initializing new browser instance...');
-
-            // Remove old SingletonLock if it exists
-            if (process.platform !== 'win32') {
-                try {
-                    const lockFile = path.join(this.options.userDataDir, 'SingletonLock');
-                    if (fs.existsSync(lockFile)) {
-                        fs.unlinkSync(lockFile);
-                        console.log('Removed old browser lock file');
-                    }
-                } catch (e) {
-                    console.warn('Failed to remove lock file:', e.message);
-                }
-            }
-
             const launchOptions = {
                 headless: this.options.headless,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
                     '--disable-gpu',
                     '--disable-software-rasterizer',
-                    '--disable-webgl',
+                    '--disable-web-security',
+                    '--disable-features=NetworkServiceInProcess',
+                    '--disable-features=TranslateUI',
                     '--disable-features=IsolateOrigins,site-per-process',
                     '--disable-site-isolation-trials',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                    '--ignore-certificate-errors',
-                    '--ignore-https-errors=yes',
-                    '--disable-extensions',
-                    '--disable-background-networking',
-                    '--disable-sync',
-                    '--metrics-recording-only',
-                    '--mute-audio',
-                    '--no-first-run',
-                    '--safebrowsing-disable-auto-update',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-default-apps',
-                    '--disable-hang-monitor',
-                    '--disable-prompt-on-repost',
-                    '--disable-background-timer-throttling',
-                    '--disable-renderer-backgrounding',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-ipc-flooding-protection',
-                    '--window-size=1920,1080',
-                    `--user-data-dir=${this.options.userDataDir}`,
-                    '--remote-debugging-port=0' // Random port
+                    '--host-resolver-rules=MAP * 0.0.0.0 , EXCLUDE localhost',
+                    '--dns-prefetch-disable'
                 ],
-                timeout: 60000,
-                defaultViewport: null,
+                userDataDir: this.options.userDataDir,
                 ignoreHTTPSErrors: true,
-                dumpio: true, // Browser logs to console
-                ...this.options.launchOptions
+                timeout: this.options.defaultTimeout
             };
 
-            // Add proxy if configured
             if (this.options.proxy) {
                 const proxy = this.options.proxy;
-                try {
-                    // Формируем URL прокси с учетом аутентификации, если есть
-                    const proxyUrl = proxy.username && proxy.password
-                        ? `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`
-                        : `http://${proxy.host}:${proxy.port}`;
-
-                    console.log(`Using proxy: ${proxy.host}:${proxy.port}`);
-                    
-                    // Добавляем прокси в аргументы запуска
-                    launchOptions.args.push(`--proxy-server=${proxyUrl}`);
-                    
-                    // Настройка обхода прокси для локальных адресов
-                    const bypassList = [
-                        'localhost',
-                        '127.0.0.1',
-                        '::1',
-                        '<-loopback>',
-                        ...(proxy.bypass || [])
-                    ];
-                    
-                    launchOptions.args.push(`--proxy-bypass-list=${bypassList.join(';')}`);
-                    
-                    // Дополнительные настройки для стабильности прокси
-                    launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
-                    launchOptions.args.push('--disable-site-isolation-trials');
-                    
-                } catch (e) {
-                    console.error('Error configuring proxy:', e);
-                    throw new Error(`Invalid proxy configuration: ${e.message}`);
-                }
+                const proxyUrl = proxy.username && proxy.password
+                    ? `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`
+                    : `http://${proxy.host}:${proxy.port}`;
+                launchOptions.args.push(`--proxy-server=${proxyUrl}`);
+                launchOptions.args.push(`--proxy-bypass-list=localhost;127.0.0.1;::1;<-loopback>`);
             }
 
-            // Launch the browser
-            this.browser = await puppeteer.launch(launchOptions);
+            try {
+                this.browser = await puppeteer.launch(launchOptions);
+            } catch (error) {
+                console.error('Browser launch failed:', error);
+                await this.cleanupLockFiles();
+                throw error;
+            }
 
-            // Create a new page
-            const pages = await this.browser.pages();
-            this.page = pages[0] || await this.browser.newPage();
+            this.page = await this.browser.newPage();
+            await this.page.setViewport({ width: 1920, height: 1080 });
+            await this.page.setUserAgent(new UserAgent().toString());
 
-            // Set default navigation timeout
-            this.page.setDefaultNavigationTimeout(this.options.defaultTimeout);
-
-            // Browser disconnect handler
             this.browser.on('disconnected', async () => {
                 console.warn('Browser disconnected, attempting to restart...');
                 this.browser = null;
@@ -191,18 +149,13 @@ class BrowserManager extends EventEmitter {
                 }
             });
 
-            // Configure page settings
-            await this.page.setUserAgent(new UserAgent().toString());
             await this.page.setJavaScriptEnabled(true);
             await this.page.setDefaultNavigationTimeout(this.options.defaultTimeout);
             await this.page.setDefaultTimeout(this.options.defaultTimeout);
-
-            // Clear browser data
             await this.clearBrowserData();
 
             console.log('Browser initialized successfully');
             return this.page;
-
         } catch (error) {
             console.error('Browser initialization failed:', error);
             this.emit('error', error);
@@ -211,206 +164,138 @@ class BrowserManager extends EventEmitter {
             this.isInitializing = false;
         }
     }
-
-    async closeBrowser() {
-        if (!this.browser) {
-            console.log('No browser instance to close');
-            return;
-        }
-
-        let browserPid = null;
-        let browserWSEndpoint = this.browserWSEndpoint;
-        
-        try {
-            // Получаем PID процесса браузера до закрытия
-            try {
-                const process = this.browser.process();
-                browserPid = process ? process.pid : null;
-                console.log(`Closing browser process (PID: ${browserPid || 'unknown'})...`);
-            } catch (e) {
-                console.warn('Could not get browser process ID:', e.message);
-            }
-
-            // Закрываем все страницы
-            try {
-                const pages = await this.browser.pages();
-                console.log(`Closing ${pages.length} pages...`);
-                
-                // Закрываем страницы с таймаутом
-                await Promise.race([
-                    Promise.all(pages.map(page => 
-                        page.close()
-                            .catch(e => console.warn('Error closing page:', e.message))
-                    )),
-                    new Promise(resolve => setTimeout(resolve, 5000)) // Таймаут 5 секунд
-                ]);
-            } catch (e) {
-                console.warn('Error closing pages:', e.message);
-            }
-
-            // Закрываем браузер
-            try {
-                console.log('Closing browser instance...');
-                await this.browser.close();
-                console.log('Browser closed successfully');
-            } catch (e) {
-                console.error('Error closing browser gracefully:', e.message);
-                throw e; // Пробрасываем ошибку для обработки в блоке catch
-            }
-            }
-
-            // Additional cleanup for Unix-based systems
-            if (process.platform === 'linux' || process.platform === 'darwin') {
-                try {
-                    // Kill any remaining Chrome/Chromium processes
-                    exec('pkill -f chrome || true');
-                    exec('pkill -f chromium || true');
-                } catch (e) {
-                    console.warn('Error cleaning up browser processes:', e.message);
-                }
-            }
-
-        } catch (error) {
-            console.error('Error during browser cleanup:', error);
-            this.emit('error', error);
-        } finally {
-            this.browser = null;
-            this.page = null;
-            this.isInitializing = false;
-
-            // Small delay before next operation
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
     }
 
-    async clearBrowserData() {
-        if (!this.page) return;
-
+    async killProcessTree(pid) {
         try {
-            // Clear storage
-            await this.page.evaluate(() => {
-                try {
-                    localStorage.clear();
-                    sessionStorage.clear();
-                    if (indexedDB && indexedDB.databases) {
-                        indexedDB.databases().then(dbs => {
-                            dbs.forEach(db => {
-                                if (db && db.name) {
-                                    indexedDB.deleteDatabase(db.name);
-                                }
-                            });
-                        }).catch(() => {});
-                    }
-                } catch (e) {
-                    console.warn('Failed to clear storage:', e);
-                }
-            });
-
-            // Clear cookies and cache
+            // Получаем список всех дочерних процессов
+            const childProcesses = await this.getProcessTree(pid);
+            
+            // Пробуем закрыть через WebSocket
             try {
-                const client = await this.page.target().createCDPSession();
-                await client.send('Network.clearBrowserCookies');
-                await client.send('Network.clearBrowserCache');
+                if (this.browser && this.browser.wsEndpoint()) {
+                    console.log('Attempting to close browser via WebSocket endpoint...');
+                    const browser = await puppeteer.connect({ browserWSEndpoint: this.browser.wsEndpoint() });
+                    await browser.close();
+                }
             } catch (e) {
-                console.warn('Failed to clear cookies/cache:', e.message);
+                console.warn('Could not close browser via WebSocket:', e.message);
             }
 
-            // Clear service workers
+            // Очищаем данные браузера
             try {
-                const client = await this.page.target().createCDPSession();
-                await client.send('ServiceWorker.enable');
-                const {registrations} = await client.send('ServiceWorker.getRegistrations');
-                await Promise.all(registrations.map(registration =>
-                    client.send('ServiceWorker.unregister', {
-                        scopeUrl: registration.scopeURL
-                    }).catch(() => {})
-                ));
-            } catch (e) {
-                console.warn('Failed to clear service workers:', e.message);
+                await this.page.evaluate(() => {
+                    try {
+                        localStorage.clear();
+                        sessionStorage.clear();
+                        if (indexedDB && indexedDB.databases) {
+                            indexedDB.databases().then(dbs => {
+                                dbs.forEach(db => {
+                                    if (db && db.name) {
+                                        indexedDB.deleteDatabase(db.name);
+                                    }
+                                });
+                            }).catch(() => {});
+                        }
+                    } catch (e) {
+                        console.warn('Error clearing storage:', e.message);
+                    }
+                });
+                    } else {
+                        resolve();
+                    }
+                });
+            });
+
+            // Проверяем состояние процесса
+            const isProcessAlive = await this.isProcessAlive(pid);
+            if (isProcessAlive) {
+                console.warn('Process still alive, using SIGKILL...');
+                const killCmd = process.platform === 'win32' 
+                    ? `taskkill /F /T /PID ${pid}` 
+                    : `kill -9 ${pid}`;
+                await exec(killCmd);
             }
 
         } catch (error) {
-            console.warn('Failed to clear browser data:', error);
+            console.error('Error in killProcessTree:', error);
+            throw error;
+        } finally {
+            console.log('Cleaning up browser resources...');
+            
+            // Очищаем данные браузера
+            try {
+                await this.clearBrowserData();
+            } catch (e) {
+                console.warn('Error clearing browser data:', e.message);
+            }
+            
+            // Удаляем lock-файлы
+            try {
+                await this.cleanupLockFiles();
+            } catch (e) {
+                console.warn('Error cleaning up lock files:', e.message);
+            }
+            
+            // Очищаем временные директории
+            try {
+                const tempDirs = [
+                    path.join(this.options.userDataDir, 'Crashpad'),
+                    path.join(this.options.userDataDir, 'Crash Reports'),
+                    path.join(this.options.userDataDir, 'DawnCache'),
+                    path.join(this.options.userDataDir, 'GPUCache'),
+                    path.join(this.options.userDataDir, 'ShaderCache'),
+                    path.join(this.options.userDataDir, 'shared_proto_db')
+                ];
+                
+                for (const dir of tempDirs) {
+                    try {
+                        if (fs.existsSync(dir)) {
+                            await fs.remove(dir);
+                            console.log(`Cleaned up directory: ${dir}`);
+                        }
+                    } catch (e) {
+                        console.warn(`Failed to clean up ${dir}:`, e.message);
+                    }
+                }
+            } catch (e) {
+                console.warn('Error cleaning up temp files:', e.message);
+            }
+            
+            // Освобождаем ресурсы
+            this.browser = null;
+            this.page = null;
         }
     }
 
     async restartBrowser() {
-        console.log('Initiating browser restart...');
-        this.operationCount = 0;
-        this.lastRestartTime = Date.now();
-
         const maxRetries = 3;
-        let lastError = null;
+        const baseDelay = 1000;
+        const maxDelay = 10000;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                console.log(`Restart attempt ${attempt}/${maxRetries}`);
-                
-                // Закрываем браузер с принудительной очисткой
-                try {
+                // Закрываем текущий браузер
+                if (this.browser) {
                     await this.closeBrowser();
-                } catch (closeError) {
-                    console.warn('Error during browser close:', closeError.message);
-                    // Продолжаем, даже если не удалось корректно закрыть
                 }
 
-                // Добавляем задержку с экспоненциальной отсрочкой
-                if (attempt > 1) {
-                    const baseDelay = 2000 * Math.pow(2, attempt);
-                    const jitter = Math.floor(Math.random() * 2000); // Добавляем случайность
-                    const delay = baseDelay + jitter;
-                    
-                    console.log(`Waiting ${Math.round(delay/1000)}s before next restart attempt...`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
+                // Очищаем данные браузера
+                await this.clearBrowserData();
+
+                // Инициализируем новый браузер
+                const page = await this.initializeBrowser();
+
+                // Проверяем стабильность страницы
+                if (!await this.isPageStable(page)) {
+                    throw new Error('Page is not stable after restart');
                 }
 
-                // Очищаем кэш и временные файлы
-                try {
-                    const tempDirs = [
-                        path.join(this.options.userDataDir, 'Crashpad'),
-                        path.join(this.options.userDataDir, 'Crash Reports'),
-                        path.join(this.options.userDataDir, 'DawnCache'),
-                        path.join(this.options.userDataDir, 'GPUCache'),
-                        path.join(this.options.userDataDir, 'ShaderCache'),
-                        path.join(this.options.userDataDir, 'shared_proto_db')
-                    ];
-                    
-                    for (const dir of tempDirs) {
-                        try {
-                            if (fs.existsSync(dir)) {
-                                await fs.remove(dir);
-                                console.log(`Cleaned up directory: ${dir}`);
-                            }
-                        } catch (cleanupError) {
-                            console.warn(`Failed to clean up ${dir}:`, cleanupError.message);
-                        }
-                    }
-                } catch (cleanupError) {
-                    console.warn('Error during cleanup:', cleanupError.message);
-                }
-
-                // Инициализируем новый экземпляр браузера
-                console.log('Initializing new browser instance...');
-                await this.initializeBrowser();
-                
-                // Проверяем, что браузер работает
-                if (!this.browser || !this.page) {
-                    throw new Error('Browser initialization completed but browser or page is null');
-                }
-
-                // Проверяем, что страница отвечает
-                try {
-                    await this.page.evaluate(() => true);
-                } catch (e) {
-                    throw new Error('New browser page is not responsive');
-                }
-
-                console.log('Browser restarted successfully');
-                return; // Успешный перезапуск
+                console.log(`Browser restarted successfully after ${attempt} attempts`);
+                return;
 
             } catch (error) {
-                lastError = error;
-                const errorMessage = error.message || 'Unknown error during browser restart';
+                console.error(`Restart attempt ${attempt} failed:`, error);
                 console.error(`Browser restart failed (attempt ${attempt}/${maxRetries}):`, errorMessage);
                 
                 // Логируем стек для неожиданных ошибок
@@ -444,72 +329,58 @@ class BrowserManager extends EventEmitter {
     }
 
     async safePageOperation(operation) {
-        const maxRetries = this.options.maxRetries;
-        let lastError = null;
+        const maxRetries = 3;
+        const baseDelay = 1000;
+        const maxDelay = 10000;
         let lastPage = null;
-        let operationName = operation.name || 'anonymous';
-        
-        console.log(`Starting operation: ${operationName}`);
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            let page;
             try {
-                // Получаем страницу с проверкой на необходимость перезапуска браузера
-                page = await this.getPage();
+                // Получаем страницу
+                const page = await this.getPage();
                 lastPage = page;
-                
-                // Проверяем, что страница живая
-                try {
-                    await page.evaluate(() => true);
-                } catch (e) {
-                    console.warn('Page is not responsive, recreating...');
-                    await this.restartBrowser();
-                    page = await this.getPage();
-                    lastPage = page;
-                }
 
                 // Проверяем стабильность страницы
                 if (!await this.isPageStable(page)) {
                     throw new Error('Page is not stable');
                 }
 
-                console.log(`Operation attempt ${attempt}/${maxRetries}`);
+                // Получаем URL страницы
+                const url = await page.evaluate(() => window.location.href);
+                console.log(`Operation URL: ${url}`);
+
+                // Выполняем операцию
                 const result = await operation(page);
 
-                // Проверяем стабильность после операции
+                // Проверяем стабильность страницы после операции
                 if (!await this.isPageStable(page)) {
                     throw new Error('Page became unstable after operation');
                 }
 
-                this.retryCount = 0; // Сбрасываем счетчик попыток при успехе
-                console.log(`Operation ${operationName} completed successfully`);
                 return result;
 
             } catch (error) {
-                lastError = error;
-                const errorMessage = error.message || 'Unknown error';
-                console.warn(`Attempt ${attempt}/${maxRetries} failed:`, errorMessage);
-                
-                // Логируем стек вызовов для ошибок, не связанных с таймаутом
-                if (!errorMessage.includes('timeout') && !errorMessage.includes('Timeout')) {
-                    console.error('Error stack:', error.stack);
-                }
-                
-                // Делаем скриншот при ошибке, если страница доступна
+                console.warn(`Attempt ${attempt} failed:`, error.message);
+
+                // Делаем скриншот при ошибке
                 if (lastPage && !lastPage.isClosed()) {
                     try {
                         const screenshot = await lastPage.screenshot({ encoding: 'base64' });
-                        console.log('Screenshot of the page when error occurred:');
                         console.log(`data:image/png;base64,${screenshot}`);
-                    } catch (screenshotError) {
-                        console.warn('Failed to take screenshot:', screenshotError.message);
+                    } catch (e) {
+                        console.warn('Error taking screenshot:', e.message);
                     }
                 }
 
-                if (attempt < maxRetries) {
-                    // Экспоненциальная задержка с рандомизацией
-                    const baseDelay = 1000 * Math.pow(2, attempt);
-                    const jitter = Math.floor(Math.random() * 1000); // Добавляем случайность
+                // Проверяем, нужно ли перезапустить браузер
+                if (this.shouldRestartBrowser(error)) {
+                    try {
+                        await this.restartBrowser();
+                    } catch (e) {
+                        console.error('Failed to restart browser:', e);
+                        throw e;
+                    const baseDelay = 2000 * Math.pow(2, attempt);
+                    const jitter = Math.floor(Math.random() * 2000); // Добавляем случайность
                     const delay = baseDelay + jitter;
                     
                     console.log(`Retrying in ${Math.round(delay/1000)}s... (attempt ${attempt + 1}/${maxRetries})`);
@@ -525,79 +396,354 @@ class BrowserManager extends EventEmitter {
                             // Продолжаем попытки, даже если не удалось перезапустить
                         }
                     }
+                } else {
+                    // Если последняя попытка, логируем дополнительную информацию
+                    console.error('Operation failed after all retries');
+                    console.error('Error details:', {
+                        message: errorMessage,
+                        stack: error.stack,
+                        code: error.code,
+                        name: error.name
+                    });
                 }
             }
         }
 
-        // All attempts exhausted
+        // Если все попытки исчерпаны
         const error = new Error(
-            `Failed to complete operation after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`
+            `Failed to complete operation after ${maxRetries} attempts: ${error?.message || 'Unknown error'}`
         );
         this.emit('operationFailed', error);
         throw error;
     }
 
-    shouldRestartBrowser(error) {
-        if (!error || !error.message) return false;
+    async closeBrowser() {
+        try {
+            if (!this.browser) {
+                console.log('Browser is already closed');
+                return;
+            }
 
-        const errorMessage = error.message.toLowerCase();
-        const criticalErrors = [
-            'navigation', 'timeout', 'detached', 'closed', 'crashed',
-            'session', 'target', 'protocol', 'socket', 'connection',
-            'no such', 'failed to launch', 'no support', 'proxy',
-            'net::', 'ERR_', 'NS_', 'TARGET_', 'ECONNREFUSED', 'ENOTFOUND'
-        ];
+            // Закрываем все страницы
+            const pages = await this.browser.pages();
+            for (const page of pages) {
+                try {
+                    await page.close();
+                } catch (e) {
+                    console.warn(`Error closing page: ${e.message}`);
+                }
+            }
 
-        return criticalErrors.some(criticalError =>
-            errorMessage.includes(criticalError.toLowerCase())
-        );
+            // Закрываем браузер
+            try {
+                await this.browser.close();
+            } catch (e) {
+                console.warn('Error closing browser:', e.message);
+                // Принудительно убиваем процесс
+                await this.killProcessTree(this.browser.process().pid);
+            }
+
+            this.browser = null;
+            this.page = null;
+            console.log('Browser closed successfully');
+
+        } catch (error) {
+            console.error('Error in closeBrowser:', error);
+            throw error;
+        }
     }
 
-    // Alias for backward compatibility
-    async performOperation(operation) {
-        return this.safePageOperation(operation);
+    async cleanupLockFiles() {
+        try {
+            // Получаем путь к профилю Chromium
+            const userDataDir = this.options.userDataDir;
+            if (!userDataDir) return;
+
+            // Очищаем lock-файлы
+            const lockFiles = [
+                path.join(userDataDir, 'SingletonLock'),
+                path.join(userDataDir, 'SingletonSocket'),
+                path.join(userDataDir, 'SingletonCookie'),
+                path.join(userDataDir, 'SingletonPipe'),
+                path.join(userDataDir, 'SingletonSocketLock')
+            ];
+
+            for (const file of lockFiles) {
+                try {
+                    if (fs.existsSync(file)) {
+                        await fs.remove(file);
+                        console.log(`Cleaned up lock file: ${file}`);
+                    }
+                } catch (e) {
+                    console.warn(`Failed to clean up ${file}:`, e.message);
+                }
+            }
+
+            // Очищаем временные директории
+            const tempDirs = [
+                path.join(userDataDir, 'Crashpad'),
+                path.join(userDataDir, 'Crash Reports'),
+                path.join(userDataDir, 'DawnCache'),
+                path.join(userDataDir, 'GPUCache'),
+                path.join(userDataDir, 'ShaderCache'),
+                path.join(userDataDir, 'shared_proto_db'),
+                path.join(userDataDir, 'Local State'),
+                path.join(userDataDir, 'Preferences')
+            ];
+
+            for (const dir of tempDirs) {
+                try {
+                    if (fs.existsSync(dir)) {
+                        await fs.remove(dir);
+                        console.log(`Cleaned up directory: ${dir}`);
+                    }
+                } catch (e) {
+                    console.warn(`Failed to clean up ${dir}:`, e.message);
+                }
+            }
+        } catch (error) {
+            console.error('Error in cleanupLockFiles:', error);
+            throw error;
+        }
+    }
+
+    async clearBrowserData() {
+        try {
+            if (!this.page) return;
+
+            await this.page.evaluate(() => {
+                try {
+                    // Очищаем localStorage
+                    localStorage.clear();
+                    
+                    // Очищаем sessionStorage
+                    sessionStorage.clear();
+                    
+                    // Очищаем IndexedDB
+                    if (indexedDB && indexedDB.databases) {
+                        indexedDB.databases().then(dbs => {
+                            dbs.forEach(db => {
+                                if (db && db.name) {
+                                    indexedDB.deleteDatabase(db.name);
+                                }
+                            });
+                        }).catch(() => {});
+                    }
+                    
+                    // Очищаем куки
+                    document.cookie.split(';').forEach(function(c) {
+                        document.cookie = c.replace(/^ +/, '').replace(/=.*/, '=;expires=' + new Date().toUTCString() + ';path=/');
+                    });
+                    
+                    // Очищаем кэш
+                    if ('caches' in window) {
+                        caches.keys().then(names => {
+                            names.forEach(name => {
+                                caches.delete(name).catch(() => {});
+                            });
+                        }).catch(() => {});
+                    }
+                    
+                    // Очищаем сервис-воркеры
+                    if ('serviceWorker' in navigator) {
+                        navigator.serviceWorker.getRegistrations().then(registrations => {
+                            registrations.forEach(registration => {
+                                registration.unregister().catch(() => {});
+                            });
+                        }).catch(() => {});
+                    }
+                    
+                } catch (e) {
+                    console.warn('Error clearing browser data:', e.message);
+                }
+            });
+        } catch (error) {
+            console.error('Error in clearBrowserData:', error);
+            throw error;
+        }
+    }
+
+    async shouldRestartBrowser(error) {
+        if (!error) return false;
+
+        const errorMessage = error.message.toLowerCase();
+        
+        // Проверяем на DBus ошибки (не критичные)
+        if (errorMessage.includes('dbus') || errorMessage.includes('upower')) {
+            console.log('Non-critical DBus error detected');
+            return false;
+        }
+
+        // Проверяем на ошибки прокси
+        if (this.options.proxy && errorMessage.includes('proxy')) {
+            console.log('Proxy error detected');
+            return true;
+        }
+
+        // Критические сетевые ошибки
+        const criticalNetworkErrors = [
+            'net::err_connection_reset',
+            'net::err_empty_response',
+            'net::err_connection_closed',
+            'net::err_connection_failed',
+            'net::err_connection_timed_out',
+            'net::err_dns_resolution_failed',
+            'net::err_ssl_protocol_error',
+            'net::err_cert_common_name_invalid',
+            'net::err_cert_date_invalid',
+            'net::err_cert_authority_invalid'
+        ];
+
+        if (criticalNetworkErrors.some(e => errorMessage.includes(e))) {
+            console.log('Critical network error detected');
+            return true;
+        }
+
+        // SSL ошибки
+        const sslErrors = [
+            'ssl',
+            'certificate',
+            'tls',
+            'handshake',
+            'expired',
+            'invalid'
+        ];
+
+        if (sslErrors.some(e => errorMessage.includes(e))) {
+            console.log('SSL error detected');
+            return true;
+        }
+
+        // Ошибки памяти
+        if (errorMessage.includes('out of memory') || errorMessage.includes('oom')) {
+            console.log('Memory error detected');
+            return true;
+        }
+
+        // Ошибки процесса
+        if (errorMessage.includes('process') || errorMessage.includes('terminated')) {
+            console.log('Process error detected');
+            return true;
+        }
+
+        // Ошибки браузера
+        if (errorMessage.includes('browser') || errorMessage.includes('chromium')) {
+            console.log('Browser error detected');
+            return true;
+        }
+
+        return false;
     }
 
     async isPageStable(page) {
         if (!page || page.isClosed()) return false;
 
         try {
-            // Check if page is responsive
+            // Проверяем, что страница отзывается
             await page.evaluate(() => true);
 
-            // Check document ready state
-            const isDocumentReady = await page.evaluate(
-                () => document.readyState === 'complete' || document.readyState === 'interactive'
-            );
+            // Проверяем состояние документа
+            const readyState = await page.evaluate(() => document.readyState);
+            if (readyState !== 'complete') return false;
 
-            if (!isDocumentReady) return false;
-
-            // Check for modal dialogs
-            const hasModal = await page.evaluate(
-                () => document.querySelector('dialog[open], .modal[open], .dialog[open]') !== null
-            );
-
-            if (hasModal) return false;
-
-            // Check for network idle
-            const networkIdle = await page.evaluate(() => {
-                try {
-                    const resources = window.performance.getEntriesByType('resource') || [];
-                    return resources
-                        .filter(r => r.initiatorType === 'xmlhttprequest' || r.initiatorType === 'fetch')
-                        .every(r => r.duration < 1000); // All requests finished within 1s
-                } catch (e) {
-                    console.warn('Network idle check failed:', e);
-                    return true; // Assume network is idle if check fails
-                }
+            // Проверяем наличие модальных диалогов
+            const hasDialog = await page.evaluate(() => {
+                const dialogs = document.getElementsByTagName('dialog');
+                return dialogs.length > 0;
             });
+            if (hasDialog) return false;
 
+            // Проверяем состояние сети
+            const networkIdle = await page.evaluate(() => {
+                const requests = performance.getEntriesByType('resource');
+                return requests.every(r => r.duration < 5000);
+            });
+            if (!networkIdle) return false;
+
+            return true;
             return networkIdle;
 
         } catch (error) {
-            console.warn('Page stability check failed:', error);
+            console.warn('Error checking page stability:', error);
             return false;
         }
+    }
+
+    async shouldRestartBrowser(error) {
+        if (!error || !error.message) return false;
+
+        const errorMessage = error.message.toLowerCase();
+        
+        // Проверяем на наличие DBus ошибок
+        if (errorMessage.includes('dbus') || errorMessage.includes('upower') || 
+            errorMessage.includes('systemd') || errorMessage.includes('glib') || 
+            errorMessage.includes('gobject')) {
+            console.warn('Detected DBus-related error:', errorMessage);
+            return true;
+        }
+
+        // Проверяем на наличие ошибок с прокси
+        if (this.options.proxy && errorMessage.includes('proxy')) {
+            return true;
+        }
+
+        // Проверяем на наличие критических сетевых ошибок
+        const criticalNetworkErrors = [
+            'net::err_no_supported_proxies',
+            'net::err_proxy_connection_failed',
+            'net::err_connection_timed_out',
+            'net::err_connection_closed',
+            'net::err_connection_reset',
+            'net::err_connection_aborted',
+            'net::err_connection_refused',
+            'net::err_tunnel_connection_failed',
+            'net::err_ssl_protocol_error',
+            'net::err_invalid_response',
+            'net::err_empty_response',
+            'net::err_connection_failed',
+            'net::err_name_not_resolved',
+            'net::err_dns_resolution_failed'
+        ];
+
+        if (criticalNetworkErrors.some(error => errorMessage.includes(error))) {
+            return true;
+        }
+
+        // Проверяем на наличие SSL ошибок
+        const sslErrors = [
+            'net::err_ssl_version_or_cipher_mismatch',
+            'net::err_ssl_weak_server_ephemeral_dh_key',
+            'net::err_ssl_server_certificate_error',
+            'net::err_ssl_certificate_error',
+            'net::err_ssl_weak_server_cipher',
+            'net::err_ssl_weak_signature_algorithm',
+            'net::err_ssl_unsafe_negotiation'
+        ];
+
+        if (sslErrors.some(error => errorMessage.includes(error))) {
+            return true;
+        }
+
+        // Проверяем на наличие ошибок с памятью
+        if (errorMessage.includes('out of memory') || errorMessage.includes('oom')) {
+            return true;
+        }
+
+        // Проверяем на наличие ошибок с процессом
+        if (errorMessage.includes('process') || errorMessage.includes('terminated')) {
+            return true;
+        }
+
+        // Проверяем на наличие ошибок с браузером
+        if (errorMessage.includes('browser') || errorMessage.includes('chromium')) {
+            return true;
+        }
+
+        return false;
+    }
+
+    async performOperation(operation) {
+        return this.safePageOperation(operation);
     }
 }
 
