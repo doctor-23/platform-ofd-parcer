@@ -4,7 +4,7 @@ const path = require('path');
 const axios = require('axios');
 const {Cluster} = require('puppeteer-cluster');
 const UserAgent = require('user-agents');
-const { isSuccess, logSuccessId, logFailedId, logErrorId } = require('./utils/storage');
+const { isSuccess, logSuccessId, logFailedId, logErrorId,  } = require('./utils/storage');
 // Конфигурация
 const CONFIG = {
     threads: 10, // Количество потоков
