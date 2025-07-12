@@ -3,16 +3,18 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const {Cluster} = require('puppeteer-cluster');
-
+import UserAgent from 'user-agents';
+const { isSuccess, logSuccessId, logFailedId } = require('./utils/storage');
 // Конфигурация
 const CONFIG = {
-    threads: 15, // Количество потоков
+    threads: 10, // Количество потоков
     maxAttempts: 3, // Попыток на чек
     delayBetweenRequests: 5000, // Задержка между запросами (мс)
     outputDir: 'results',
     captchaDir: 'captcha',
     errorDir: 'errors',
     capmonsterApiKey: 'c0906acd7fe0ee7abf7ae13cd2815be2', // Получить на https://capmonster.cloud/
+    // capmonsterApiKey: 'c0906acd7fe0ee7abf7ae13cd2815be2', // Получить на https://capmonster.cloud/
     // Список прокси (10 штук)
     proxies: [
         'xUEaT2:yp5SJhxMkS@141.98.134.80:3000',
@@ -93,10 +95,10 @@ async function solveCaptcha(imagePath) {
 
 (async () => {
     const receipts = loadReceipts();
-    const entries = Object.entries(receipts);
+    const entries = Object.entries(receipts).filter(([uuid]) => !isSuccess(uuid));
 
     if (entries.length === 0) {
-        console.error('Нет чеков для обработки!');
+        console.error('Нет новых чеков для обработки!');
         return;
     }
 
@@ -114,21 +116,21 @@ async function solveCaptcha(imagePath) {
                 '--disable-accelerated-2d-canvas',
                 '--disable-gpu',
                 '--disable-images'
-            ],
+            ]
         },
         retryLimit: CONFIG.maxAttempts,
-        retryDelay: 5000,
+        retryDelay: 5000
     });
 
     await cluster.task(async ({ page, data: { uuid, url, proxy } }) => {
         try {
-            page.on('error', err => console.error(`[${uuid}] Page error:`, err));
-            page.on('pageerror', err => console.error(`[${uuid}] Page runtime error:`, err));
-            page.on('close', () => console.warn(`[${uuid}] Page was closed unexpectedly`));
-
+            const randomUA = new UserAgent();
+            await page.setUserAgent(randomUA);
             const [auth, host] = proxy.split('@');
             const [username, password] = auth.split(':');
             await page.authenticate({ username, password });
+
+            page.on('close', () => console.warn(`[${uuid}] Page was closed unexpectedly`));
 
             await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
 
@@ -149,11 +151,13 @@ async function solveCaptcha(imagePath) {
             const html = await page.content();
             fs.writeFileSync(path.join(CONFIG.outputDir, `result_${uuid}.html`), html);
 
+            logSuccessId(uuid);
             console.log(`[${uuid}] ✅ Success`);
 
-        } catch (err) {
-            console.error(`[${uuid}] ❌ ${err.message}`);
-            throw err;
+        } catch (error) {
+            logFailedId(uuid, error.message);
+            console.error(`[${uuid}] ❌ ${error.message}`);
+            throw error;
         }
     });
 
@@ -169,4 +173,3 @@ async function solveCaptcha(imagePath) {
 
     console.log(`==> Обработка завершена: ${formatDate(new Date())}`);
 })();
-

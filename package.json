@@ -11,11 +11,13 @@
   "description": "",
   "dependencies": {
     "axios": "^1.10.0",
+    "cheerio": "^1.1.0",
     "form-data": "^4.0.3",
     "fs": "^0.0.1-security",
     "jimp": "^1.6.0",
     "puppeteer": "^24.12.1",
     "puppeteer-cluster": "^0.24.0",
-    "tesseract.js": "^6.0.1"
+    "tesseract.js": "^6.0.1",
+    "user-agents": "^1.1.597"
   }
 }
