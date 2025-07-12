@@ -1,6 +1,6 @@
 const { exec } = require('child_process');
 
-const RESTART_INTERVAL_MINUTES = 10;
+const RESTART_INTERVAL_MINUTES = 2;
 
 function restartScript() {
     console.log(`[${new Date().toISOString()}] 🔄 Перезапуск скрипта...`);
