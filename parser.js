@@ -125,7 +125,7 @@ async function solveCaptcha(imagePath) {
     await cluster.task(async ({ page, data: { uuid, url, proxy } }) => {
         try {
             const randomUA = new UserAgent();
-            await page.setUserAgent(randomUA);
+            await page.setUserAgent(randomUA.toString());
             const [auth, host] = proxy.split('@');
             const [username, password] = auth.split(':');
             await page.authenticate({ username, password });
