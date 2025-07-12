@@ -1,35 +1,25 @@
 const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
-// Загрузим HTML из файла или строки
-// Путь к файлу
-const filePath = './results/result_49825b98271940518da92d40ae1e38ac.html';
 
-// Чтение HTML
-const html = fs.readFileSync(filePath, 'utf-8');
-
-// Извлечение имени файла без пути
-const fileName = path.basename(filePath); // 'result_49825b98271940518da92d40ae1e38ac.html'
-
-// Извлечение id из названия файла
-const match = fileName.match(/^result_(.+)\.html$/);
-
-if (!match) {
-    throw new Error('Не удалось извлечь id из имени файла');
-}
-
-const checkId = match[1]; // '49825b98271940518da92d40ae1e38ac' // или html = '<!DOCTYPE html>...'
-const $ = cheerio.load(html);
-
-// Функция для парсинга
+// Функция для парсинга одного чека
 function parseCheck($) {
     const result = {};
-
     // Заголовки
     result.company = $('.cheque-company__title').text().trim();
     result.address = $('.cheque-company__address').text().trim();
     result.inn = $('.cheque-company__tax-id-number').text().trim().replace(/^ИНН /, '');
     result.place = $('.cheque-company__legal-address').text().replace(/Место расчётов:\s*/, '').trim();
+
+    // Извлекаем URL чека из кнопки скачивания
+    const downloadLink = $('.btn.btn-primary.btn-block[href^="/web/noauth/cheque/pdf-"]').attr('href');
+    if (downloadLink) {
+        const match = downloadLink.match(/pdf-(\d+)-(\d+)-(\d+)/);
+        if (match) {
+            const [_, id, date, fp] = match;
+            result.receipt_url = `https://lk.platformaofd.ru/web/noauth/cheque/id?id=${id}&date=${date}&fp=${fp}`;
+        }
+    }
 
     // Основная информация
     const fields = {};
@@ -42,7 +32,6 @@ function parseCheck($) {
     });
 
     // Основные поля
-    result.id = checkId;
     result.check_number = $('.cheque__title').text().match(/№\s*(\d+)/)?.[1] || null;
     result.operation_type = $('.cheque-text__container').first().find('p').first().text().trim();
     result.operation_time = $('.cheque-text__container').first().find('p').last().text().trim();
@@ -50,7 +39,7 @@ function parseCheck($) {
     result.buyer_email = fields['телефон или электронный адрес покупателя'] || null;
     result.tax_system = fields['применяемая система налогообложения'] || null;
     result.cashier = fields['кассир'] || null;
-    result.fpd = fields['дополнительные данные'] || null;
+    result.original_fpd = fields['дополнительные данные'] || null;
     result.sender_email = fields['адрес электронной почты отправителя чека'] || null;
     result.kkt_number = fields['номер автомата'] || null;
     result.correction_type = fields['тип коррекции'] || null;
@@ -79,6 +68,71 @@ function parseCheck($) {
     return result;
 }
 
-// Используем
-const data = parseCheck($);
-console.log(JSON.stringify(data, null, 2));
+// Функция для обработки всех файлов в директории results
+async function processResultsDirectory() {
+    const resultsDir = path.join(__dirname, 'results');
+    const resultJsonPath = path.join(__dirname, 'result.json');
+    
+    // Проверяем и создаем директорию results
+    if (!fs.existsSync(resultsDir)) {
+        fs.mkdirSync(resultsDir);
+    }
+
+    // Читаем существующий result.json или создаем пустой массив
+    let existingResults = [];
+    if (fs.existsSync(resultJsonPath)) {
+        try {
+            existingResults = JSON.parse(fs.readFileSync(resultJsonPath, 'utf-8'));
+        } catch (error) {
+            console.error('Ошибка при чтении result.json:', error);
+            existingResults = [];
+        }
+    }
+
+    // Получаем список всех HTML файлов в директории results
+    const files = fs.readdirSync(resultsDir).filter(file => 
+        file.endsWith('.html') && file.startsWith('result_')
+    );
+
+    for (const file of files) {
+        try {
+            const filePath = path.join(resultsDir, file);
+            const html = fs.readFileSync(filePath, 'utf-8');
+            const $ = cheerio.load(html);
+
+            // Извлекаем id из имени файла
+            const match = file.match(/^result_(.+)\.html$/);
+            if (!match) {
+                console.warn(`Пропускаем файл ${file}: не соответствует паттерну`);
+                continue;
+            }
+
+            const checkId = match[1];
+
+            // Проверяем, существует ли уже этот id
+            const existingCheck = existingResults.find(r => r.id === checkId);
+            if (existingCheck) {
+                console.log(`Пропускаем файл ${file}: чек с id ${checkId} уже существует`);
+                continue;
+            }
+
+            // Парсим чек
+            const result = parseCheck($);
+            result.id = checkId; // Добавляем id после парсинга
+
+            // Добавляем результат
+            existingResults.push(result);
+            console.log(`Обработан файл ${file}: успешно добавлен чек с id ${checkId}`);
+
+            // Сохраняем результаты после каждого успешного парсинга
+            fs.writeFileSync(resultJsonPath, JSON.stringify(existingResults, null, 2));
+        } catch (error) {
+            console.error(`Ошибка при обработке файла ${file}:`, error);
+        }
+    }
+
+    console.log(`Обработка завершена. Всего обработано ${existingResults.length} чеков.`);
+}
+
+// Запускаем обработку
+processResultsDirectory();
