@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 
 const successFile = path.join(__dirname, '../results/success.json');
-const errorFile = path.join(__dirname, '../errors/failed.json');
+const errorFileFull = path.join(__dirname, '../errors/failed.json');
+const errorFileIds = path.join(__dirname, '../errors/failed-ids.json');
 
 function getJSON(filePath) {
     try {
@@ -30,8 +31,16 @@ function isSuccess(id) {
     return data.includes(id);
 }
 
+function logErrorId(id) {
+    const data = getJSON(errorFileIds);
+    if (!data.includes(id)) {
+        data.push(id);
+        saveJSON(errorFileIds, data);
+    }
+}
+
 function logFailedId(id, reason) {
-    const errors = getJSON(errorFile);
+    const errors = getJSON(errorFileFull);
 
     const existing = errors.find(e => e.id === id);
 
@@ -48,7 +57,7 @@ function logFailedId(id, reason) {
         });
     }
 
-    saveJSON(errorFile, errors);
+    saveJSON(errorFileFull, errors);
 }
 
 function getFailedIds() {
@@ -60,4 +69,5 @@ module.exports = {
     isSuccess,
     logFailedId,
     getFailedIds,
+    logErrorId
 };
