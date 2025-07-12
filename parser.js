@@ -6,7 +6,7 @@ const {Cluster} = require('puppeteer-cluster');
 
 // Конфигурация
 const CONFIG = {
-    threads: 25, // Количество потоков
+    threads: 15, // Количество потоков
     maxAttempts: 3, // Попыток на чек
     delayBetweenRequests: 5000, // Задержка между запросами (мс)
     outputDir: 'results',
