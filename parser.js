@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const {Cluster} = require('puppeteer-cluster');
-import UserAgent from 'user-agents';
+const UserAgent = require('user-agents');
 const { isSuccess, logSuccessId, logFailedId } = require('./utils/storage');
 // Конфигурация
 const CONFIG = {
