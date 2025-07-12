@@ -9,180 +9,152 @@ const CONFIG = {
     threads: 25, // Количество потоков
     maxAttempts: 3, // Попыток на чек
     delayBetweenRequests: 2000, // Задержка между запросами (мс)
-    outputDir: 'results', // Папка для результатов
+    outputDir: 'results',
+    captchaDir: 'captcha',
+    errorDir: 'errors',
     capmonsterApiKey: 'c0906acd7fe0ee7abf7ae13cd2815be2', // Получить на https://capmonster.cloud/
     // Список прокси (10 штук)
     proxies: [
-        '141.98.134.80:3000',
-        '45.88.150.74:3000',
-        '45.89.102.188:3000',
-        '92.119.41.2:3000',
-        '92.119.43.32:3000',
-        '46.8.155.59:3000',
-        '46.8.222.200:3000',
-        '188.130.210.174:3000',
-        '45.90.196.78:3000',
-        '46.8.222.100:3000',
+        'xUEaT2:yp5SJhxMkS@141.98.134.80:3000',
+        'xUEaT2:yp5SJhxMkS@45.88.150.74:3000',
+        'xUEaT2:yp5SJhxMkS@45.89.102.188:3000',
+        'xUEaT2:yp5SJhxMkS@92.119.41.2:3000',
+        'xUEaT2:yp5SJhxMkS@92.119.43.32:3000',
+        'xUEaT2:yp5SJhxMkS@46.8.155.59:3000',
+        'xUEaT2:yp5SJhxMkS@46.8.222.200:3000',
+        'xUEaT2:yp5SJhxMkS@188.130.210.174:3000',
+        'xUEaT2:yp5SJhxMkS@45.90.196.78:3000',
+        'xUEaT2:yp5SJhxMkS@46.8.222.100:3000',
     ],
     // Чеки (UUID: URL)
-    receiptsFile: 'corrections-links.json',
+    receiptsFile: 'receipts.json',
 };
 
+// Вспомогательные функции
 function formatDate(date) {
     const d = new Date(date);
-    const day = String(d.getDate()).padStart(2, '0');
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const year = d.getFullYear();
-    const hours = String(d.getHours()).padStart(2, '0');
-    const minutes = String(d.getMinutes()).padStart(2, '0');
-    const seconds = String(d.getSeconds()).padStart(2, '0');
-    return `${day}.${month}.${year} ${hours}:${minutes}:${seconds}`;
+    return `${String(d.getDate()).padStart(2, '0')}.${String(d.getMonth() + 1).padStart(2, '0')}.${d.getFullYear()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
 }
 
-// Загрузка чеков из JSON
 function loadReceipts() {
     try {
         const data = fs.readFileSync(CONFIG.receiptsFile, 'utf8');
         return JSON.parse(data);
-    } catch (error) {
-        console.error('Ошибка загрузки receipts.json:', error.message);
+    } catch (err) {
+        console.error('Ошибка загрузки receipts.json:', err.message);
         process.exit(1);
     }
 }
 
-// Создаем папку для результатов
-if (!fs.existsSync(CONFIG.outputDir)) {
-    fs.mkdirSync(CONFIG.outputDir);
-}
+// Создание директорий
+[CONFIG.outputDir, CONFIG.captchaDir, CONFIG.errorDir].forEach(dir => {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+});
 
-// Решение капчи через CapMonster Cloud
+// Решение капчи через CapMonster
 async function solveCaptcha(imagePath) {
     try {
-        const imageBase64 = fs.readFileSync(imagePath, {encoding: 'base64'});
-        const response = await axios.post('https://api.capmonster.cloud/createTask', {
+        const imageBase64 = fs.readFileSync(imagePath, 'base64');
+        const {data: taskResp} = await axios.post('https://api.capmonster.cloud/createTask', {
             clientKey: CONFIG.capmonsterApiKey,
-            task: {
-                type: 'ImageToTextTask',
-                body: imageBase64,
-                case: true,
-                numeric: 1, // Только цифры
-            },
+            task: {type: 'ImageToTextTask', body: imageBase64, case: true, numeric: 1}
         });
 
-        const taskId = response.data.taskId;
-        console.log(`Капча отправлена, Task ID: ${taskId}`);
+        const taskId = taskResp.taskId;
+        console.log(`→ Капча отправлена, Task ID: ${taskId}`);
 
-        // Ожидаем решения (проверяем каждые 2 секунды)
         for (let i = 0; i < 30; i++) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            const result = await axios.post('https://api.capmonster.cloud/getTaskResult', {
+            await new Promise(r => setTimeout(r, 2000));
+            const {data: result} = await axios.post('https://api.capmonster.cloud/getTaskResult', {
                 clientKey: CONFIG.capmonsterApiKey,
-                taskId: taskId,
+                taskId
             });
 
-            if (result.data.status === 'ready') {
-                return result.data.solution.text;
-            } else if (result.data.errorId !== 0) {
-                throw new Error(result.data.errorDescription);
-            }
+            if (result.status === 'ready') return result.solution.text;
+            if (result.errorId !== 0) throw new Error(result.errorDescription);
         }
-        throw new Error('Не удалось получить решение капчи');
-    } catch (error) {
-        console.error('Ошибка CapMonster:', error.message);
+        throw new Error('Истекло время ожидания капчи');
+    } catch (err) {
+        console.error('Ошибка CapMonster:', err.message);
         return null;
     }
 }
 
 // Главная функция
 (async () => {
-    const receipts = loadReceipts(); // Загружаем чеки из JSON
-    if (Object.keys(receipts).length === 0) {
+    const receipts = loadReceipts();
+    const entries = Object.entries(receipts);
+
+    if (entries.length === 0) {
         console.error('Нет чеков для обработки!');
-        process.exit(1);
+        return;
     }
 
-    // Создаем кластер с 25 потоками
+    console.log(`==> Начало обработки (${entries.length} чеков): ${formatDate(new Date())}`);
+
     const cluster = await Cluster.launch({
         concurrency: Cluster.CONCURRENCY_BROWSER,
-        maxConcurrency: CONFIG.threads, // 25 параллельных потоков
+        maxConcurrency: CONFIG.threads,
         puppeteerOptions: {
             headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu',
-                '--disable-images'
-            ],
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
         },
         retryLimit: CONFIG.maxAttempts,
         retryDelay: 5000,
     });
 
-    // Обработка одного чека
     await cluster.task(async ({page, data: {uuid, url, proxy}}) => {
         try {
             console.log(`[${uuid}] Обработка через прокси: ${proxy}`);
 
-            // Настраиваем прокси для этого потока
-            await page.authenticate({
-                username: proxy.split('://')[1].split('@')[0].split(':')[0],
-                password: proxy.split('://')[1].split('@')[0].split(':')[1],
-            });
+            if (proxy) {
+                const [auth, host] = proxy.replace('http://', '').split('@');
+                const [username, password] = auth.split(':');
+                const proxyUrl = `http://${host}`;
 
-            // Переход на страницу
-            await page.goto(url, {waitUntil: 'networkidle2', timeout: 30000});
+                await page.close();
+                const context = await page.browser().createIncognitoBrowserContext();
+                const newPage = await context.newPage();
+                await newPage.authenticate({username, password});
 
-            // Получаем капчу
-            const captchaElement = await page.$('#captchaImg');
-            const captchaPath = path.join(__dirname, CONFIG.outputDir, `captcha_${uuid}.png`);
-            await captchaElement.screenshot({path: captchaPath});
+                await newPage.goto(url, {waitUntil: 'networkidle2', timeout: 30000});
+                const captchaElement = await newPage.$('#captchaImg');
+                const captchaPath = path.join(CONFIG.captchaDir, `captcha_${uuid}.png`);
+                await captchaElement.screenshot({path: captchaPath});
 
-            // Решаем капчу
-            const captchaText = await solveCaptcha(captchaPath);
-            if (!captchaText) throw new Error('Не удалось решить капчу');
+                const captchaText = await solveCaptcha(captchaPath);
+                if (!captchaText) throw new Error('Не удалось решить капчу');
 
-            // Ввод данных
-            await page.type('#captcha', captchaText);
-            await page.click('button[type="submit"]');
+                await newPage.type('#captcha', captchaText);
+                await newPage.click('button[type="submit"]');
 
-            // Ожидание результата
-            await page.waitForSelector('.cheque.check.wave-top.wave-white', {timeout: 15000});
+                await newPage.waitForSelector('.cheque.check.wave-top.wave-white', {timeout: 15000});
 
-            // Сохранение HTML
-            const content = await page.content();
-            fs.writeFileSync(path.join(__dirname, CONFIG.outputDir, `result_${uuid}.html`), content);
+                const html = await newPage.content();
+                fs.writeFileSync(path.join(CONFIG.outputDir, `result_${uuid}.html`), html);
 
-            console.log(`[${uuid}] Успешно обработан`);
-        } catch (error) {
-            console.error(`[${uuid}] Ошибка: ${error.message}`);
-            throw error; // Для ретраев через cluster
+                console.log(`[${uuid}] ✅ Успешно`);
+                await context.close();
+            } else {
+                throw new Error('Прокси не задан');
+            }
+        } catch (err) {
+            const errorPath = path.join(CONFIG.errorDir, `error_${uuid}.txt`);
+            fs.writeFileSync(errorPath, `Ошибка: ${err.message}`);
+            console.error(`[${uuid}] ❌ ${err.message}`);
+            throw err;
         }
     });
 
-    // Добавляем задачи в кластер с ротацией прокси
-    const entries = Object.entries(CONFIG.receipts);
-    console.log(`<<<<<<<<<< [${formatDate(new Date())}] Начало обработки`);
     for (let i = 0; i < entries.length; i++) {
         const [uuid, url] = entries[i];
-        const proxy = CONFIG.proxies[i % CONFIG.proxies.length]; // Ротация прокси
-
-        cluster.queue({
-            uuid,
-            url,
-            proxy
-        });
-
-        // Задержка между добавлением задач
-        if (i < entries.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, CONFIG.delayBetweenRequests));
-        }
+        const proxy = CONFIG.proxies[i % CONFIG.proxies.length];
+        cluster.queue({uuid, url, proxy});
+        if (i < entries.length - 1) await new Promise(r => setTimeout(r, CONFIG.delayBetweenRequests));
     }
 
-    // Завершение работы
     await cluster.idle();
     await cluster.close();
-    console.log(`<<<<<<<<<< [${formatDate(new Date())}] Обработка завершена`);
-    console.log('Все чеки обработаны!');
+
+    console.log(`==> Обработка завершена: ${formatDate(new Date())}`);
 })();
