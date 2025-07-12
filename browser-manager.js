@@ -137,13 +137,36 @@ class BrowserManager extends EventEmitter {
             // Add proxy if configured
             if (this.options.proxy) {
                 const proxy = this.options.proxy;
-                const proxyUrl = proxy.username && proxy.password
-                    ? `http://${proxy.username}:${proxy.password}@${proxy.host}:${proxy.port}`
-                    : `http://${proxy.host}:${proxy.port}`;
+                try {
+                    // Формируем URL прокси с учетом аутентификации, если есть
+                    const proxyUrl = proxy.username && proxy.password
+                        ? `http://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@${proxy.host}:${proxy.port}`
+                        : `http://${proxy.host}:${proxy.port}`;
 
-                console.log(`Using proxy: ${proxy.host}:${proxy.port}`);
-                launchOptions.args.push(`--proxy-server=${proxyUrl}`);
-                launchOptions.args.push('--proxy-bypass-list=<-loopback>');
+                    console.log(`Using proxy: ${proxy.host}:${proxy.port}`);
+                    
+                    // Добавляем прокси в аргументы запуска
+                    launchOptions.args.push(`--proxy-server=${proxyUrl}`);
+                    
+                    // Настройка обхода прокси для локальных адресов
+                    const bypassList = [
+                        'localhost',
+                        '127.0.0.1',
+                        '::1',
+                        '<-loopback>',
+                        ...(proxy.bypass || [])
+                    ];
+                    
+                    launchOptions.args.push(`--proxy-bypass-list=${bypassList.join(';')}`);
+                    
+                    // Дополнительные настройки для стабильности прокси
+                    launchOptions.args.push('--disable-features=IsolateOrigins,site-per-process');
+                    launchOptions.args.push('--disable-site-isolation-trials');
+                    
+                } catch (e) {
+                    console.error('Error configuring proxy:', e);
+                    throw new Error(`Invalid proxy configuration: ${e.message}`);
+                }
             }
 
             // Launch the browser
@@ -190,35 +213,50 @@ class BrowserManager extends EventEmitter {
     }
 
     async closeBrowser() {
-        if (!this.browser) return;
+        if (!this.browser) {
+            console.log('No browser instance to close');
+            return;
+        }
 
-        const browserProcess = this.browser.process();
-        const browserPid = browserProcess ? browserProcess.pid : null;
-
+        let browserPid = null;
+        let browserWSEndpoint = this.browserWSEndpoint;
+        
         try {
-            // Close all pages
+            // Получаем PID процесса браузера до закрытия
+            try {
+                const process = this.browser.process();
+                browserPid = process ? process.pid : null;
+                console.log(`Closing browser process (PID: ${browserPid || 'unknown'})...`);
+            } catch (e) {
+                console.warn('Could not get browser process ID:', e.message);
+            }
+
+            // Закрываем все страницы
             try {
                 const pages = await this.browser.pages();
-                await Promise.all(pages.map(page => page.close().catch(e =>
-                    console.warn('Error closing page:', e.message)
-                )));
+                console.log(`Closing ${pages.length} pages...`);
+                
+                // Закрываем страницы с таймаутом
+                await Promise.race([
+                    Promise.all(pages.map(page => 
+                        page.close()
+                            .catch(e => console.warn('Error closing page:', e.message))
+                    )),
+                    new Promise(resolve => setTimeout(resolve, 5000)) // Таймаут 5 секунд
+                ]);
             } catch (e) {
                 console.warn('Error closing pages:', e.message);
             }
 
-            // Close the browser
+            // Закрываем браузер
             try {
+                console.log('Closing browser instance...');
                 await this.browser.close();
+                console.log('Browser closed successfully');
             } catch (e) {
-                console.warn('Error closing browser:', e.message);
-                // Force kill the process if it's still alive
-                if (browserPid && process.platform !== 'win32') {
-                    try {
-                        process.kill(browserPid, 'SIGKILL');
-                    } catch (killError) {
-                        console.warn('Failed to kill browser process:', killError.message);
-                    }
-                }
+                console.error('Error closing browser gracefully:', e.message);
+                throw e; // Пробрасываем ошибку для обработки в блоке catch
+            }
             }
 
             // Additional cleanup for Unix-based systems
@@ -297,36 +335,109 @@ class BrowserManager extends EventEmitter {
     }
 
     async restartBrowser() {
-        console.log('Restarting browser...');
+        console.log('Initiating browser restart...');
         this.operationCount = 0;
         this.lastRestartTime = Date.now();
 
         const maxRetries = 3;
-        let lastError;
+        let lastError = null;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                await this.closeBrowser();
+                console.log(`Restart attempt ${attempt}/${maxRetries}`);
+                
+                // Закрываем браузер с принудительной очисткой
+                try {
+                    await this.closeBrowser();
+                } catch (closeError) {
+                    console.warn('Error during browser close:', closeError.message);
+                    // Продолжаем, даже если не удалось корректно закрыть
+                }
 
-                // Add delay between retries
+                // Добавляем задержку с экспоненциальной отсрочкой
                 if (attempt > 1) {
-                    const delay = 1000 * Math.pow(2, attempt); // Exponential backoff
-                    console.log(`Retry ${attempt}/${maxRetries} in ${delay}ms...`);
+                    const baseDelay = 2000 * Math.pow(2, attempt);
+                    const jitter = Math.floor(Math.random() * 2000); // Добавляем случайность
+                    const delay = baseDelay + jitter;
+                    
+                    console.log(`Waiting ${Math.round(delay/1000)}s before next restart attempt...`);
                     await new Promise(resolve => setTimeout(resolve, delay));
                 }
 
+                // Очищаем кэш и временные файлы
+                try {
+                    const tempDirs = [
+                        path.join(this.options.userDataDir, 'Crashpad'),
+                        path.join(this.options.userDataDir, 'Crash Reports'),
+                        path.join(this.options.userDataDir, 'DawnCache'),
+                        path.join(this.options.userDataDir, 'GPUCache'),
+                        path.join(this.options.userDataDir, 'ShaderCache'),
+                        path.join(this.options.userDataDir, 'shared_proto_db')
+                    ];
+                    
+                    for (const dir of tempDirs) {
+                        try {
+                            if (fs.existsSync(dir)) {
+                                await fs.remove(dir);
+                                console.log(`Cleaned up directory: ${dir}`);
+                            }
+                        } catch (cleanupError) {
+                            console.warn(`Failed to clean up ${dir}:`, cleanupError.message);
+                        }
+                    }
+                } catch (cleanupError) {
+                    console.warn('Error during cleanup:', cleanupError.message);
+                }
+
+                // Инициализируем новый экземпляр браузера
+                console.log('Initializing new browser instance...');
                 await this.initializeBrowser();
+                
+                // Проверяем, что браузер работает
+                if (!this.browser || !this.page) {
+                    throw new Error('Browser initialization completed but browser or page is null');
+                }
+
+                // Проверяем, что страница отвечает
+                try {
+                    await this.page.evaluate(() => true);
+                } catch (e) {
+                    throw new Error('New browser page is not responsive');
+                }
+
                 console.log('Browser restarted successfully');
-                return; // Success
+                return; // Успешный перезапуск
 
             } catch (error) {
                 lastError = error;
-                console.error(`Browser restart failed (attempt ${attempt}/${maxRetries}):`, error.message);
+                const errorMessage = error.message || 'Unknown error during browser restart';
+                console.error(`Browser restart failed (attempt ${attempt}/${maxRetries}):`, errorMessage);
+                
+                // Логируем стек для неожиданных ошибок
+                if (!errorMessage.includes('timeout') && !errorMessage.includes('Timeout')) {
+                    console.error('Error details:', error);
+                }
 
-                // If last attempt, rethrow the error
+                // Если это последняя попытка, логируем дополнительную информацию и пробрасываем ошибку
                 if (attempt === maxRetries) {
                     console.error('Failed to restart browser after multiple attempts');
-                    throw new Error(`Failed to restart browser after ${maxRetries} attempts: ${lastError.message}`);
+                    console.error('Last error details:', {
+                        message: errorMessage,
+                        stack: error.stack,
+                        code: error.code,
+                        name: error.name
+                    });
+                    
+                    // Пробуем хотя бы закрыть браузер, если он есть
+                    try {
+                        if (this.browser) {
+                            await this.browser.close().catch(() => {});
+                        }
+                    } catch (e) {
+                        // Игнорируем ошибки при закрытии
+                    }
+                    
+                    throw new Error(`Failed to restart browser after ${maxRetries} attempts: ${errorMessage}`);
                 }
             }
         }
@@ -335,40 +446,84 @@ class BrowserManager extends EventEmitter {
     async safePageOperation(operation) {
         const maxRetries = this.options.maxRetries;
         let lastError = null;
+        let lastPage = null;
+        let operationName = operation.name || 'anonymous';
+        
+        console.log(`Starting operation: ${operationName}`);
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            let page;
             try {
-                const page = await this.getPage();
+                // Получаем страницу с проверкой на необходимость перезапуска браузера
+                page = await this.getPage();
+                lastPage = page;
+                
+                // Проверяем, что страница живая
+                try {
+                    await page.evaluate(() => true);
+                } catch (e) {
+                    console.warn('Page is not responsive, recreating...');
+                    await this.restartBrowser();
+                    page = await this.getPage();
+                    lastPage = page;
+                }
 
-                // Check page stability before operation
+                // Проверяем стабильность страницы
                 if (!await this.isPageStable(page)) {
                     throw new Error('Page is not stable');
                 }
 
+                console.log(`Operation attempt ${attempt}/${maxRetries}`);
                 const result = await operation(page);
 
-                // Check page stability after operation
+                // Проверяем стабильность после операции
                 if (!await this.isPageStable(page)) {
                     throw new Error('Page became unstable after operation');
                 }
 
-                this.retryCount = 0; // Reset retry counter on success
+                this.retryCount = 0; // Сбрасываем счетчик попыток при успехе
+                console.log(`Operation ${operationName} completed successfully`);
                 return result;
 
             } catch (error) {
                 lastError = error;
-                console.warn(`Attempt ${attempt}/${maxRetries} failed:`, error.message);
+                const errorMessage = error.message || 'Unknown error';
+                console.warn(`Attempt ${attempt}/${maxRetries} failed:`, errorMessage);
+                
+                // Логируем стек вызовов для ошибок, не связанных с таймаутом
+                if (!errorMessage.includes('timeout') && !errorMessage.includes('Timeout')) {
+                    console.error('Error stack:', error.stack);
+                }
+                
+                // Делаем скриншот при ошибке, если страница доступна
+                if (lastPage && !lastPage.isClosed()) {
+                    try {
+                        const screenshot = await lastPage.screenshot({ encoding: 'base64' });
+                        console.log('Screenshot of the page when error occurred:');
+                        console.log(`data:image/png;base64,${screenshot}`);
+                    } catch (screenshotError) {
+                        console.warn('Failed to take screenshot:', screenshotError.message);
+                    }
+                }
 
                 if (attempt < maxRetries) {
-                    // Exponential backoff
-                    const delay = 1000 * Math.pow(2, attempt);
-                    console.log(`Retrying in ${delay}ms...`);
+                    // Экспоненциальная задержка с рандомизацией
+                    const baseDelay = 1000 * Math.pow(2, attempt);
+                    const jitter = Math.floor(Math.random() * 1000); // Добавляем случайность
+                    const delay = baseDelay + jitter;
+                    
+                    console.log(`Retrying in ${Math.round(delay/1000)}s... (attempt ${attempt + 1}/${maxRetries})`);
                     await new Promise(resolve => setTimeout(resolve, delay));
 
-                    // Force restart on critical errors
+                    // Перезапускаем браузер при критических ошибках
                     if (this.shouldRestartBrowser(error)) {
                         console.log('Critical error detected, restarting browser...');
-                        await this.restartBrowser();
+                        try {
+                            await this.restartBrowser();
+                        } catch (restartError) {
+                            console.error('Failed to restart browser:', restartError);
+                            // Продолжаем попытки, даже если не удалось перезапустить
+                        }
                     }
                 }
             }
