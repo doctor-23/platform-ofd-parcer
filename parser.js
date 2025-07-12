@@ -144,7 +144,7 @@ async function solveCaptcha(imagePath) {
             await page.type('#captcha', captchaText);
             await page.click('button[type="submit"]');
 
-            await page.waitForSelector('.cheque.check.wave-top.wave-white', { timeout: 15000 });
+            await page.waitForSelector('.cheque.check.wave-top.wave-white', { timeout: 60000 });
 
             const html = await page.content();
             fs.writeFileSync(path.join(CONFIG.outputDir, `result_${uuid}.html`), html);
